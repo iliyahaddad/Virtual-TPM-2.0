@@ -33,4 +33,4 @@ An example service configuration is provided at `src/service/config.json.example
 
 ## License
 
-Add the project license here. The TPM engine includes its upstream license file at `src/engine/LICENSE`; retain applicable third-party license and attribution notices when redistributing the source.
+See LICENSE file.
