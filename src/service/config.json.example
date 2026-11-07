@@ -1,0 +1,12 @@
+# vTPM2 Configuration File
+# Copy this to config.json next to vtpmservice.exe to customize the service.
+# All fields are optional; defaults are used when omitted.
+
+{
+  "stateDir": "%PROGRAMDATA%\\vTPM2",
+  "httpPort": 8082,
+  "httpBind": "127.0.0.1",
+  "logRetention": 500,
+  "startupType": "CLEAR",
+  "secureDelete": false
+}

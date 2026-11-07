@@ -1,0 +1,571 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 Deployment Theory.
+
+package tpm2
+
+import (
+	"crypto/rand"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"sync"
+)
+
+// headerLen is the fixed size of a TPM 2.0 command/response header:
+// tag (2) + size (4) + code/responseCode (4).
+const headerLen = 10
+
+// TPM is a software TPM 2.0 command processor. It is transport-agnostic: feed it
+// raw command blobs via Execute and it returns raw response blobs. A TPM is safe
+// for concurrent Execute calls (the TPM model is single-threaded, so calls are
+// serialized internally).
+type TPM struct {
+	mu        sync.Mutex
+	pcr       *pcrState
+	h         *hierarchies
+	sessions  *sessionTable
+	objects   *objectTable
+	sequences *sequenceTable
+	nv        *nvStore
+	da        *daState
+	clock     *clockState
+	locality  byte // locality of the current command (set via the transport)
+	rand      io.Reader
+
+	// Audit subsystem (TPM 2.0 Part 1, §19). audit holds the command-audit digest
+	// and the set of audited command codes; exclusiveAudit is the handle of the
+	// session that currently holds exclusive audit status (0 if none).
+	audit          auditState
+	exclusiveAudit uint32
+
+	// EC commit subsystem (TPM 2.0 Part 1, §C.2): commitCount is the running
+	// counter returned by TPM2_Commit/TPM2_EC_Ephemeral; committed maps a counter's
+	// low 16 bits to the ephemeral private scalar so TPM2_ZGen_2Phase can recover it.
+	commitCount uint64
+	committed   map[uint16]*ecCommit
+
+	// Management state: the vendor algorithm set (TPM2_SetAlgorithmSet), the set of
+	// commands requiring physical presence (TPM2_PP_Commands), the Authenticated
+	// Countdown Timers (TPM2_ACT_SetTimeout) and the NV read-only flag
+	// (TPM2_ReadOnlyControl).
+	algorithmSet uint32
+	ppRequired   map[uint32]bool
+	actTimers    map[uint32]*actTimer
+	readOnly     bool
+	// contextKey protects saved contexts (TPM2_ContextSave); it is volatile and
+	// regenerated on reset, so saved contexts do not survive a reboot.
+	contextKey []byte
+	contextSeq uint64
+	started    bool // TPM2_Startup has completed
+	failed     bool // entered failure mode; only diagnostic commands answer
+
+	// savedState holds the snapshot produced by TPM2_Shutdown(TPM_SU_STATE) so
+	// that TPM2_Startup(TPM_SU_STATE) can restore it. Nil until a STATE shutdown
+	// has occurred.
+	savedState *Snapshot
+
+	// onPersist is invoked by Shutdown(TPM_SU_STATE) to write the snapshot to
+	// durable storage. Set by the Host layer. Nil means persistence is not
+	// wired up.
+	onPersist func() error
+
+	// onLoad is invoked by Startup(TPM_SU_STATE) to read the snapshot from
+	// durable storage. Set by the Host layer. Nil means persistence is not
+	// wired up.
+	onLoad func() (*Snapshot, error)
+
+	// drbg is a Hash_DRBG (SP800-90A §10.1.1) used as the TPM's entropy source
+	// for TPM2_GetRandom. It is instantiated from crypto/rand at power-on and
+	// reseeded by TPM2_StirRandom. This gives StirRandom real semantics:
+	// additional input is incorporated into the DRBG state per the reseed rules.
+	drbg     *hashDRBG
+	drbgMu   sync.Mutex
+
+	// stateRestored is true when the TPM's state was restored from a persisted
+	// snapshot (via Restore/LoadInto), simulating a process restart after a
+	// TPM2_Shutdown(TPM_SU_STATE). This allows Startup(TPM_SU_STATE) to succeed
+	// even though savedState (set by Shutdown(STATE) on the same instance) is nil.
+	stateRestored bool
+}
+
+// New returns a powered-on but not-yet-started TPM (TPM2_Startup is still
+// required, mirroring real hardware). It uses crypto/rand as its entropy source.
+// A fresh TPM mints new primary seeds; they are persisted on first save.
+func New() *TPM {
+	// Instantiate a Hash_DRBG (SP800-90A §10.1.1) seeded from crypto/rand as the
+	// TPM's entropy source. The DRBG is reseeded by TPM2_StirRandom so that
+	// additional input is incorporated into the generator state.
+	entropy := make([]byte, 48)
+	if _, err := io.ReadFull(rand.Reader, entropy); err != nil {
+		panic(fmt.Errorf("tpm2: cannot read entropy: %w", err))
+	}
+	drbg := newHashDRBG(AlgSHA256, entropy)
+
+	return &TPM{
+		pcr:        newPCRState(),
+		h:          newHierarchies(),
+		sessions:   newSessionTable(),
+		objects:    newObjectTable(),
+		sequences:  newSequenceTable(),
+		nv:         newNVStore(),
+		da:         newDAState(),
+		clock:      newClockState(),
+		rand:       rand.Reader,
+		contextKey: randomSeed(),
+		audit:      auditState{hashAlg: AlgSHA256},
+		drbg:       drbg,
+	}
+}
+
+// session is a parsed command authorization (TPMS_AUTH_COMMAND).
+type session struct {
+	handle uint32
+	nonce  []byte
+	attrs  byte
+	hmac   []byte
+}
+
+// Execute processes one command blob and returns one response blob. It never
+// returns a Go error: protocol problems are encoded as TPM response codes, as a
+// real TPM does.
+func (t *TPM) Execute(cmd []byte) []byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if len(cmd) < headerLen {
+		return errorResponse(RCCommandSize)
+	}
+	tag := binary.BigEndian.Uint16(cmd[0:])
+	size := binary.BigEndian.Uint32(cmd[2:])
+	code := binary.BigEndian.Uint32(cmd[6:])
+
+	if tag != TPMSTNoSessions && tag != TPMSTSessions {
+		return errorResponse(RCBadTag)
+	}
+	if int(size) != len(cmd) {
+		return errorResponse(RCCommandSize)
+	}
+
+	r := newReader(cmd[headerLen:])
+
+	// In failure mode only GetTestResult and GetCapability are answered.
+	if t.failed && code != CCGetTestResult && code != CCGetCapability {
+		return errorResponse(RCFailure)
+	}
+
+	switch code {
+	case CCStartup:
+		return t.cmdStartup(r)
+	case CCShutdown:
+		return t.cmdShutdown(r)
+	case CCSelfTest:
+		return t.cmdSelfTest(r)
+	case CCGetTestResult:
+		return t.cmdGetTestResult(r)
+	case CCGetRandom:
+		return t.cmdGetRandom(r)
+	case CCStirRandom:
+		return t.cmdStirRandom(r)
+	case CCGetCapability:
+		return t.cmdGetCapability(r)
+	case CCPCRRead:
+		return t.cmdPCRRead(r)
+	case CCPCRExtend:
+		return t.cmdPCRExtend(tag, r)
+	case CCPCRReset:
+		return t.cmdPCRReset(tag, r)
+	case CCClear:
+		return t.cmdClear(tag, r)
+	case CCClearControl:
+		return t.cmdClearControl(tag, r)
+	case CCHierarchyChangeAuth:
+		return t.cmdHierarchyChangeAuth(tag, r)
+	case CCSetPrimaryPolicy:
+		return t.cmdSetPrimaryPolicy(tag, r)
+	case CCHierarchyControl:
+		return t.cmdHierarchyControl(tag, r)
+	case CCChangeEPS:
+		return t.cmdChangeSeed(tag, CCChangeEPS, r, &t.h.endorsement)
+	case CCChangePPS:
+		return t.cmdChangeSeed(tag, CCChangePPS, r, &t.h.platform)
+	case CCStartAuthSession:
+		return t.cmdStartAuthSession(r)
+	case CCFlushContext:
+		return t.cmdFlushContext(r)
+	case CCPolicyPCR:
+		return t.cmdPolicyPCR(r)
+	case CCPolicyCommandCode:
+		return t.cmdPolicyCommandCode(r)
+	case CCPolicyAuthValue:
+		return t.cmdPolicyAuthValue(r)
+	case CCPolicyOR:
+		return t.cmdPolicyOR(r)
+	case CCPolicyGetDigest:
+		return t.cmdPolicyGetDigest(r)
+	case CCPolicyRestart:
+		return t.cmdPolicyRestart(r)
+	case CCDictionaryAttackLockReset:
+		return t.cmdDictionaryAttackLockReset(tag, r)
+	case CCDictionaryAttackParameters:
+		return t.cmdDictionaryAttackParameters(tag, r)
+	case CCCreatePrimary:
+		return t.cmdCreatePrimary(tag, r)
+	case CCEvictControl:
+		return t.cmdEvictControl(tag, r)
+	case CCCreate:
+		return t.cmdCreate(tag, r)
+	case CCLoad:
+		return t.cmdLoad(tag, r)
+	case CCLoadExternal:
+		return t.cmdLoadExternal(r)
+	case CCObjectChangeAuth:
+		return t.cmdObjectChangeAuth(tag, r)
+	case CCContextSave:
+		return t.cmdContextSave(r)
+	case CCContextLoad:
+		return t.cmdContextLoad(r)
+	case CCReadPublic:
+		return t.cmdReadPublic(r)
+	case CCNVDefineSpace:
+		return t.cmdNVDefineSpace(tag, r)
+	case CCNVUndefineSpace:
+		return t.cmdNVUndefineSpace(tag, r)
+	case CCNVReadPublic:
+		return t.cmdNVReadPublic(r)
+	case CCNVWrite:
+		return t.cmdNVWrite(tag, r)
+	case CCNVRead:
+		return t.cmdNVRead(tag, r)
+	case CCNVIncrement:
+		return t.cmdNVIncrement(tag, r)
+	case CCNVExtend:
+		return t.cmdNVExtend(tag, r)
+	case CCNVSetBits:
+		return t.cmdNVSetBits(tag, r)
+	case CCNVWriteLock:
+		return t.cmdNVWriteLock(tag, r)
+	case CCNVReadLock:
+		return t.cmdNVReadLock(tag, r)
+	case CCUnseal:
+		return t.cmdUnseal(tag, r)
+	case CCSign:
+		return t.cmdSign(tag, r)
+	case CCVerifySignature:
+		return t.cmdVerifySignature(r)
+	case CCHash:
+		return t.cmdHash(r)
+	case CCQuote:
+		return t.cmdQuote(tag, r)
+	case CCReadClock:
+		return t.cmdReadClock(r)
+	case CCRSAEncrypt:
+		return t.cmdRSAEncrypt(r)
+	case CCRSADecrypt:
+		return t.cmdRSADecrypt(tag, r)
+	case CCECDHKeyGen:
+		return t.cmdECDHKeyGen(r)
+	case CCECDHZGen:
+		return t.cmdECDHZGen(tag, r)
+	case CCECCParameters:
+		return t.cmdECCParameters(r)
+	case CCHMAC:
+		return t.cmdHMAC(tag, r)
+	case CCHMACStart:
+		return t.cmdHMACStart(tag, r)
+	case CCHashSequenceStart:
+		return t.cmdHashSequenceStart(r)
+	case CCSequenceUpdate:
+		return t.cmdSequenceUpdate(tag, r)
+	case CCSequenceComplete:
+		return t.cmdSequenceComplete(tag, r)
+	case CCEventSequenceComplete:
+		return t.cmdEventSequenceComplete(tag, r)
+	case CCPolicyCpHash:
+		return t.cmdPolicyCpHash(r)
+	case CCPolicyNameHash:
+		return t.cmdPolicyNameHash(r)
+	case CCPolicyLocality:
+		return t.cmdPolicyLocality(r)
+	case CCPolicyPhysicalPresence:
+		return t.cmdPolicyPhysicalPresence(r)
+	case CCPolicyPassword:
+		return t.cmdPolicyPassword(r)
+	case CCPolicyNvWritten:
+		return t.cmdPolicyNvWritten(r)
+	case CCPolicyTemplate:
+		return t.cmdPolicyTemplate(r)
+	case CCPolicyCounterTimer:
+		return t.cmdPolicyCounterTimer(r)
+	case CCPolicyNV:
+		return t.cmdPolicyNV(tag, r)
+	case CCPolicySecret:
+		return t.cmdPolicySecret(tag, r)
+	case CCPolicySigned:
+		return t.cmdPolicySigned(r)
+	case CCPolicyAuthorize:
+		return t.cmdPolicyAuthorize(r)
+	case CCPolicyTicket:
+		return t.cmdPolicyTicket(r)
+	case CCPolicyAuthorizeNV:
+		return t.cmdPolicyAuthorizeNV(tag, r)
+	case CCPolicyDuplicationSelect:
+		return t.cmdPolicyDuplicationSelect(r)
+	case CCPolicyCapability:
+		return t.cmdPolicyCapability(r)
+	case CCPolicyParameters:
+		return t.cmdPolicyParameters(r)
+	case CCPolicyTransportSPDM:
+		return t.cmdPolicyTransportSPDM(r)
+	case CCMakeCredential:
+		return t.cmdMakeCredential(r)
+	case CCActivateCredential:
+		return t.cmdActivateCredential(tag, r)
+	case CCDuplicate:
+		return t.cmdDuplicate(tag, r)
+	case CCImport:
+		return t.cmdImport(tag, r)
+	case CCRewrap:
+		return t.cmdRewrap(tag, r)
+	case CCCertify:
+		return t.cmdCertify(tag, r)
+	case CCCertifyCreation:
+		return t.cmdCertifyCreation(tag, r)
+	case CCGetTime:
+		return t.cmdGetTime(tag, r)
+	case CCNVCertify:
+		return t.cmdNVCertify(tag, r)
+	case CCSetCommandCodeAuditStatus:
+		return t.cmdSetCommandCodeAuditStatus(tag, r)
+	case CCGetSessionAuditDigest:
+		return t.cmdGetSessionAuditDigest(tag, r)
+	case CCGetCommandAuditDigest:
+		return t.cmdGetCommandAuditDigest(tag, r)
+	case CCCertifyX509:
+		return t.cmdCertifyX509(tag, r)
+	case CCClockSet:
+		return t.cmdClockSet(tag, r)
+	case CCClockRateAdjust:
+		return t.cmdClockRateAdjust(tag, r)
+	case CCPCREvent:
+		return t.cmdPCREvent(tag, r)
+	case CCNVChangeAuth:
+		return t.cmdNVChangeAuth(tag, r)
+	case CCNVGlobalWriteLock:
+		return t.cmdNVGlobalWriteLock(tag, r)
+	case CCPCRAllocate:
+		return t.cmdPCRAllocate(tag, r)
+	case CCPCRSetAuthValue:
+		return t.cmdPCRSetAuthValue(tag, r)
+	case CCPCRSetAuthPolicy:
+		return t.cmdPCRSetAuthPolicy(tag, r)
+	case CCNVUndefineSpaceSpecial:
+		return t.cmdNVUndefineSpaceSpecial(tag, r)
+	case CCCommit:
+		return t.cmdCommit(tag, r)
+	case CCECEphemeral:
+		return t.cmdECEphemeral(tag, r)
+	case CCZGen2Phase:
+		return t.cmdZGen2Phase(tag, r)
+	case CCIncrementalSelfTest:
+		return t.cmdIncrementalSelfTest(r)
+	case CCTestParms:
+		return t.cmdTestParms(r)
+	case CCSetAlgorithmSet:
+		return t.cmdSetAlgorithmSet(tag, r)
+	case CCPPCommands:
+		return t.cmdPPCommands(tag, r)
+	case CCEncryptDecrypt:
+		return t.cmdEncryptDecrypt(tag, r)
+	case CCEncryptDecrypt2:
+		return t.cmdEncryptDecrypt2(tag, r)
+	case CCCreateLoaded:
+		return t.cmdCreateLoaded(tag, r)
+	case CCECCEncrypt:
+		return t.cmdECCEncrypt(r)
+	case CCECCDecrypt:
+		return t.cmdECCDecrypt(tag, r)
+	case CCACTSetTimeout:
+		return t.cmdACTSetTimeout(tag, r)
+	case CCReadOnlyControl:
+		return t.cmdReadOnlyControl(tag, r)
+	case CCSignDigest:
+		return t.cmdSignDigest(tag, r)
+	case CCVerifyDigestSignature:
+		return t.cmdVerifyDigestSignature(r)
+	case CCSignSequenceStart:
+		return t.cmdSignSequenceStart(r)
+	case CCSignSequenceComplete:
+		return t.cmdSignSequenceComplete(tag, r)
+	case CCVerifySequenceStart:
+		return t.cmdVerifySequenceStart(r)
+	case CCVerifySequenceComplete:
+		return t.cmdVerifySequenceComplete(tag, r)
+	case CCEncapsulate:
+		return t.cmdEncapsulate(r)
+	case CCDecapsulate:
+		return t.cmdDecapsulate(tag, r)
+	default:
+		return errorResponse(RCCommandCode)
+	}
+}
+
+// Init models a TPM (re)initialization at the hardware level — the swtpm
+// CMD_INIT a hypervisor sends when the VM powers on. It clears the started flag
+// so the guest firmware must issue TPM2_Startup again; persistent PCR values are
+// retained until TPM2_Startup(CLEAR) zeroes the resettable banks. deleteVolatile
+// additionally discards any accumulated PCR extends, returning every bank to its
+// power-on value.
+func (t *TPM) Init(deleteVolatile bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.started = false
+	t.failed = false
+	t.h.reset()                    // regenerate the volatile null-hierarchy seed, restore enables
+	t.sessions = newSessionTable() // sessions are volatile: dropped on reset
+	t.objects.resetTransient()     // transient objects are volatile; persistent ones remain
+	t.sequences.reset()            // hash/HMAC sequences are volatile
+	t.contextKey = randomSeed()    // invalidate any previously saved contexts
+	t.exclusiveAudit = 0           // exclusive audit status is tied to volatile sessions
+	t.committed = nil              // committed ephemeral scalars are volatile
+	if t.audit.hashAlg == AlgNull {
+		t.audit.hashAlg = AlgSHA256 // default command-audit algorithm
+	}
+	if deleteVolatile {
+		t.pcr.reset()
+	}
+}
+
+// SetLocality records the locality at which subsequent commands are received.
+// The swtpm transport calls this on CMD_SET_LOCALITY; PCR operations enforce the
+// per-PCR locality attributes against it (TPM 2.0 Part 1, §17.4 / PC Client).
+func (t *TPM) SetLocality(loc byte) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.locality = loc
+}
+
+// requireStarted returns an INITIALIZE error response if Startup has not run.
+func (t *TPM) requireStarted() []byte {
+	if !t.started {
+		return errorResponse(RCInitialize)
+	}
+	return nil
+}
+
+// readAuthArea parses the command authorization area (present only when the
+// command tag is TPM_ST_SESSIONS): authSize (UINT32) followed by one or more
+// TPMS_AUTH_COMMAND sessions filling exactly authSize bytes.
+func readAuthArea(r *reader) ([]session, bool) {
+	authSize := int(r.u32())
+	if r.err != nil || authSize < 0 || authSize > r.remaining() {
+		return nil, false
+	}
+	end := r.off + authSize
+	var sessions []session
+	for r.off < end {
+		s := session{
+			handle: r.u32(),
+			nonce:  r.bytes(int(r.u16())),
+			attrs:  r.u8(),
+			hmac:   r.bytes(int(r.u16())),
+		}
+		if r.err != nil {
+			return nil, false
+		}
+		sessions = append(sessions, s)
+	}
+	if r.off != end || len(sessions) == 0 {
+		return nil, false
+	}
+	return sessions, true
+}
+
+// putHeader writes a TPM command/response header (tag, size, code/responseCode)
+// into the first headerLen bytes of buf.
+func putHeader(buf []byte, tag uint16, size, code uint32) {
+	binary.BigEndian.PutUint16(buf[0:], tag)
+	binary.BigEndian.PutUint32(buf[2:], size)
+	binary.BigEndian.PutUint32(buf[6:], code)
+}
+
+// errorResponse builds a 10-byte error response. Per the TPM 2.0 spec an error
+// response always uses TPM_ST_NO_SESSIONS and carries only the header.
+func errorResponse(rc uint32) []byte {
+	out := make([]byte, headerLen)
+	putHeader(out, TPMSTNoSessions, headerLen, rc)
+	return out
+}
+
+// successResponse frames a successful response. When sessionCount > 0 the
+// response is tagged TPM_ST_SESSIONS and carries a parameterSize field plus one
+// empty acknowledgment session per request session (sufficient for password
+// authorizations); otherwise it is tagged TPM_ST_NO_SESSIONS.
+func successResponse(params []byte, sessionCount int) []byte {
+	var body writer
+	if sessionCount > 0 {
+		body.u32(uint32(len(params)))
+		body.raw(params)
+		for i := 0; i < sessionCount; i++ {
+			body.u16(0) // empty nonceTPM
+			body.u8(0)  // sessionAttributes
+			body.u16(0) // empty hmac/ack
+		}
+	} else {
+		body.raw(params)
+	}
+
+	tag := TPMSTNoSessions
+	if sessionCount > 0 {
+		tag = TPMSTSessions
+	}
+	payload := body.bytes()
+	out := make([]byte, headerLen, headerLen+len(payload))
+	binary.BigEndian.PutUint16(out[0:], tag)
+	binary.BigEndian.PutUint32(out[2:], uint32(headerLen+len(payload)))
+	binary.BigEndian.PutUint32(out[6:], RCSuccess)
+	return append(out, payload...)
+}
+
+// SetPersistenceHandlers wires the TPM to durable storage. onPersist is invoked
+// by TPM2_Shutdown(TPM_SU_STATE) to write the snapshot to disk; onLoad is
+// invoked by TPM2_Startup(TPM_SU_STATE) to read it back. Either may be nil when
+// persistence is not available (the TPM then runs stateless across restarts).
+func (t *TPM) SetPersistenceHandlers(onPersist func() error, onLoad func() (*Snapshot, error)) {
+	t.onPersist = onPersist
+	t.onLoad = onLoad
+}
+
+// ReseedDRBG incorporates additional entropy into the TPM's Hash_DRBG per
+// SP800-90A §10.1.1.3 reseed rules: new input is hashed together with the
+// current DRBG state (V ‖ C) to produce a reinstantiation seed. This gives
+// TPM2_StirRandom real semantics — caller-provided input affects subsequent
+// TPM2_GetRandom output.
+func (t *TPM) ReseedDRBG(additionalInput []byte) {
+	t.drbgMu.Lock()
+	defer t.drbgMu.Unlock()
+
+	// Reseed: seedMaterial = (V ‖ C ‖ additionalInput). Hash_df produces a new
+	// seed; V and C are re-derived from it.
+	seedMaterial := make([]byte, 0, len(t.drbg.v)+len(t.drbg.c)+len(additionalInput))
+	seedMaterial = append(seedMaterial, t.drbg.v...)
+	seedMaterial = append(seedMaterial, t.drbg.c...)
+	seedMaterial = append(seedMaterial, additionalInput...)
+
+	t.drbg.v = t.drbg.hashDF(seedMaterial, t.drbg.seedlen)
+	t.drbg.c = t.drbg.hashDF(append([]byte{0x00}, t.drbg.v...), t.drbg.seedlen)
+	t.drbg.rc = 1
+	t.drbg.buf = nil // discard buffered output so reseed takes effect immediately
+}
+
+// drbgRead reads n bytes from the DRBG, mixing in any stirred state. Called by
+// TPM2_GetRandom.
+func (t *TPM) drbgRead(n int) ([]byte, error) {
+	t.drbgMu.Lock()
+	defer t.drbgMu.Unlock()
+
+	buf := make([]byte, n)
+	if _, err := t.drbg.Read(buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}

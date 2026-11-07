@@ -1,0 +1,502 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 Deployment Theory.
+
+package tpm2
+
+import "sort"
+
+// taggedProperty is one TPMS_TAGGED_PROPERTY (property tag + value).
+type taggedProperty struct {
+	property uint32
+	value    uint32
+}
+
+// fixedProperties is the ascending list of TPM_PT values reported under
+// TPM_CAP_TPM_PROPERTIES. Order matters: GetCapability returns properties with
+// tag >= the requested property, in this order, up to propertyCount. These are
+// PT_FIXED identity/capacity values; run-time PT_VAR properties are added with the
+// subsystems that own them (hierarchies, sessions).
+var fixedProperties = []taggedProperty{
+	{PTFamilyIndicator, 0x322E3000}, // "2.0\0"
+	{PTLevel, 0},
+	{PTRevision, 185}, // TPM_SPEC_VERSION; since v184 PT_REVISION = TPM_SPEC_VERSION (not ×100)
+	{PTDayOfYear, 71}, // 2026-03-12, the v1.85 release date
+	{PTYear, 2026},
+	{PTManufacturer, 0x44505448},  // "DPTH"
+	{PTVendorString1, 0x76747061}, // "vtpa" (vtpm2)
+	{PTVendorString2, 0},
+	{PTVendorString3, 0},
+	{PTVendorString4, 0},
+	{PTVendorTPMType, 0},
+	{PTFirmwareVersion1, 0x00010000}, // 1.0
+	{PTFirmwareVersion2, 0},
+	{PTInputBuffer, 1024},
+	{PTHRTransientMin, 3},
+	{PTHRPersistentMin, 7},
+	{PTHRLoadedMin, 3},
+	{PTActiveSessionMax, 64},
+	{PTPCRCount, numPCR},
+	{PTPCRSelectMin, pcrSelectMin},
+	{PTContextGapMax, 0xFFFF},
+	{PTNVCountersMax, 0}, // no NV slots reserved exclusively for counters
+	{PTNVIndexMax, 2048}, // largest NV index data size
+	{PTMemory, 0},        // TPMA_MEMORY: nothing shared between RAM and NV
+	{PTClockUpdate, 1 << 17},
+	{PTContextHash, uint32(AlgSHA256)},
+	{PTContextSym, uint32(AlgAES)},
+	{PTContextSymSize, 128},
+	{PTOrderlyCount, 255}, // counter increments before an NV write is forced
+	{PTMaxCommandSize, 4096},
+	{PTMaxResponseSize, 4096},
+	{PTMaxDigest, 32}, // SHA-256
+	{PTMaxObjectContext, 2048},
+	{PTMaxSessionContext, 2048},
+	// PC Client platform identity. TPM_PT_PS_FAMILY_INDICATOR = 1 is "PC Client"
+	// (TCG PC Client Platform TPM Profile). Windows' tpm.sys reads this group during
+	// StartDevice; with the triple absent the device was refused outright.
+	{PTPSFamilyIndicator, 1},
+	{PTPSLevel, 0},
+	{PTPSRevision, 105}, // PC Client Platform TPM Profile 1.05
+	{PTSplitMax, 0},     // split signing not supported
+	{PTTotalCommands, uint32(len(commandTable))},
+	{PTLibraryCommands, uint32(len(commandTable))},
+	{PTVendorCommands, 0},
+	{PTNVBufferMax, 1024}, // max NV_Read/NV_Write payload, bounded by PT_INPUT_BUFFER
+	{PTModes, 0},          // TPMA_MODES: FIPS_140_2 not claimed
+	{PTMaxCapBuffer, 1024},
+}
+
+// varProperties returns the PT_VAR group — the run-time counterpart of
+// fixedProperties, reported from live state — in ascending tag order, which
+// writeProperties relies on.
+//
+// TPM_PT_PERMANENT and TPM_PT_STARTUP_CLEAR lead the group and are not optional.
+// Windows' tpm.sys reads TPM_PT_PERMANENT repeatedly during StartDevice and
+// TPM_PT_STARTUP_CLEAR once; because GetCapability returns the first property at
+// or after the requested tag, omitting them did not produce an error — a query for
+// 0x200 was answered with tag 0x20E (the lockout counter) and moreData=YES. The
+// driver therefore never learned that the hierarchies were enabled and refused the
+// device with STATUS_DEVICE_PROTOCOL_ERROR (CM_PROB_FAILED_START), while every
+// individual command still returned rc=0.
+func (t *TPM) varProperties() []taggedProperty {
+	var perm uint32
+	if len(t.h.owner.authValue) > 0 {
+		perm |= permOwnerAuthSet
+	}
+	if len(t.h.endorsement.authValue) > 0 {
+		perm |= permEndorsementAuthSet
+	}
+	if len(t.h.lockout.authValue) > 0 {
+		perm |= permLockoutAuthSet
+	}
+	if t.h.disableClear {
+		perm |= permDisableClear
+	}
+	if t.da.inLockout() {
+		perm |= permInLockout
+	}
+	// The endorsement primary seed is minted by newHierarchies/randomSeed rather
+	// than supplied by a manufacturer, so the EPS is always TPM-generated.
+	perm |= permTPMGeneratedEPS
+
+	// Orderly is left clear: the TPM does not yet persist state on
+	// TPM2_Shutdown(STATE), so it cannot honestly claim its NV is orderly. A
+	// hardware TPM reports the same after an unexpected power loss.
+	var suc uint32
+	if t.h.platform.enabled {
+		suc |= sucPHEnable
+	}
+	if t.h.owner.enabled {
+		suc |= sucSHEnable
+	}
+	if t.h.endorsement.enabled {
+		suc |= sucEHEnable
+	}
+	if t.h.phEnableNV {
+		suc |= sucPHEnableNV
+	}
+
+	return []taggedProperty{
+		{PTPermanent, perm},
+		{PTStartupClear, suc},
+		{PTLockoutCounter, t.da.failedTries},
+		{PTMaxAuthFail, t.da.maxTries},
+		{PTLockoutInterval, t.da.recoveryTime},
+		{PTLockoutRecovery, t.da.lockoutRecovery},
+	}
+}
+
+// advertisedAlgs is the ascending list of algorithms reported under
+// TPM_CAP_ALGS as TPMS_ALG_PROPERTY (alg id + TPMA_ALGORITHM).
+//
+// The list must describe what the TPM actually implements. It previously named
+// only the four hashes, which understated the emulator badly: RSA, ECC and AES
+// keys are creatable and usable, but a caller enumerating TPM_CAP_ALGS was told
+// this TPM does no asymmetric and no symmetric cryptography at all — not a
+// PC Client TPM by any reading. Every entry below is backed by a dispatch path
+// (see management.go for object types, sign.go/asym.go for the schemes,
+// symcipher.go for the modes); nothing aspirational belongs here.
+var advertisedAlgs = []taggedProperty{
+	{uint32(AlgRSA), algAttrAsymmetric | algAttrObject},                                      // crypto.go, management.go
+	{uint32(AlgSHA1), algAttrHash},                                                           //
+	{uint32(AlgHMAC), algAttrHash | algAttrSigning},                                          // sequence.go cmdHMAC
+	{uint32(AlgAES), algAttrSymmetric | algAttrObject},                                       // symcipher.go
+	{uint32(AlgMGF1), algAttrHash | algAttrMethod},                                           // OAEP mask generation
+	{uint32(AlgKeyedHash), algAttrHash | algAttrObject | algAttrSigning | algAttrEncrypting}, // management.go
+	{uint32(AlgXOR), algAttrHash | algAttrSymmetric},                                         // protect.go parameter encryption
+	{uint32(AlgSHA256), algAttrHash},                                                         //
+	{uint32(AlgSHA384), algAttrHash},                                                         //
+	{uint32(AlgSHA512), algAttrHash},                                                         //
+	{uint32(AlgNull), 0},                                                                     //
+	{uint32(AlgRSASSA), algAttrAsymmetric | algAttrSigning},                                  // sign.go
+	{uint32(AlgRSAES), algAttrAsymmetric | algAttrEncrypting},                                // asym.go
+	{uint32(AlgRSAPSS), algAttrAsymmetric | algAttrSigning},                                  // sign.go
+	{uint32(AlgOAEP), algAttrAsymmetric | algAttrEncrypting},                                 // asym.go
+	{uint32(AlgECDSA), algAttrAsymmetric | algAttrSigning},                                   // sign.go
+	{uint32(AlgECDH), algAttrAsymmetric | algAttrMethod},                                     // ecc.go cmdECDHZGen
+	{uint32(AlgKDF1SP80056A), algAttrHash | algAttrMethod},                                   // crypto.go kdfe
+	{uint32(AlgKDF1SP800108), algAttrHash | algAttrMethod},                                   // crypto.go kdfa
+	{uint32(AlgECC), algAttrAsymmetric | algAttrObject},                                      // crypto.go, management.go
+	{uint32(AlgSymCipher), algAttrObject | algAttrSymmetric},                                 // management.go
+	{uint32(AlgCTR), algAttrSymmetric | algAttrEncrypting},                                   // symcipher.go
+	{uint32(AlgOFB), algAttrSymmetric | algAttrEncrypting},                                   //
+	{uint32(AlgCBC), algAttrSymmetric | algAttrEncrypting},                                   //
+	{uint32(AlgCFB), algAttrSymmetric | algAttrEncrypting},                                   //
+	{uint32(AlgECB), algAttrSymmetric | algAttrEncrypting},                                   //
+}
+
+// commandTable lists the implemented commands in ascending command-code order
+// with their command-handle count, used to build TPM_CAP_COMMANDS (TPML_CCA).
+var commandTable = []struct {
+	cc       uint32
+	cHandles uint32
+}{
+	{CCNVUndefineSpaceSpecial, 2}, // 0x11F (nvIndex, platform)
+	{CCEvictControl, 2},           // auth hierarchy, objectHandle
+	{CCHierarchyControl, 1},
+	{CCNVUndefineSpace, 2}, // authHandle, nvIndex
+	{CCChangeEPS, 1},
+	{CCChangePPS, 1},
+	{CCClear, 1},
+	{CCClearControl, 1},
+	{CCClockSet, 1}, // 0x128
+	{CCHierarchyChangeAuth, 1},
+	{CCNVDefineSpace, 1},
+	{CCPCRAllocate, 1},      // 0x12B
+	{CCPCRSetAuthPolicy, 1}, // 0x12C
+	{CCPPCommands, 1},       // 0x12D
+	{CCSetPrimaryPolicy, 1},
+	{CCClockRateAdjust, 1}, // 0x130
+	{CCCreatePrimary, 1},
+	{CCNVGlobalWriteLock, 1},     // 0x132
+	{CCGetCommandAuditDigest, 2}, // 0x133 (privacyHandle, signHandle)
+	{CCNVIncrement, 2},
+	{CCNVSetBits, 2},
+	{CCNVExtend, 2},
+	{CCNVWrite, 2},
+	{CCNVWriteLock, 2},
+	{CCDictionaryAttackLockReset, 1},
+	{CCDictionaryAttackParameters, 1},
+	{CCNVChangeAuth, 1}, // 0x13B
+	{CCPCREvent, 1},     // 0x13C
+	{CCPCRReset, 1},
+	{CCSequenceComplete, 1},          // 0x13E
+	{CCSetAlgorithmSet, 1},           // 0x13F
+	{CCSetCommandCodeAuditStatus, 1}, // 0x140
+	{CCIncrementalSelfTest, 0},       // 0x142
+	{CCSelfTest, 0},
+	{CCStartup, 0},
+	{CCShutdown, 0},
+	{CCStirRandom, 0},
+	{CCActivateCredential, 2},    // 0x147 (activateHandle, keyHandle)
+	{CCCertify, 2},               // 0x148 (objectHandle, signHandle)
+	{CCPolicyNV, 3},              // 0x149 (authHandle, nvIndex, policySession)
+	{CCCertifyCreation, 2},       // 0x14A (signHandle, objectHandle)
+	{CCDuplicate, 2},             // 0x14B (objectHandle, newParentHandle)
+	{CCGetTime, 2},               // 0x14C (privacyAdmin, signHandle)
+	{CCGetSessionAuditDigest, 3}, // 0x14D (privacyAdmin, signHandle, sessionHandle)
+	{CCNVRead, 2},
+	{CCNVReadLock, 2},
+	{CCObjectChangeAuth, 2}, // objectHandle, parentHandle
+	{CCPolicySecret, 2},     // 0x151 (authHandle, policySession)
+	{CCRewrap, 2},           // 0x152 (oldParent, newParent)
+	{CCCreate, 1},
+	{CCECDHZGen, 1}, // 0x154
+	{CCHMAC, 1},     // 0x155 (= TPM2_MAC)
+	{CCImport, 1},   // 0x156
+	{CCLoad, 1},
+	{CCQuote, 1},
+	{CCRSADecrypt, 1},     // 0x159
+	{CCHMACStart, 1},      // 0x15B (= TPM2_MAC_Start)
+	{CCSequenceUpdate, 1}, // 0x15C
+	{CCSign, 1},
+	{CCUnseal, 1},
+	{CCPolicySigned, 2},   // 0x160 (authObject, policySession)
+	{CCContextLoad, 0},    // context is a parameter
+	{CCContextSave, 1},    // saveHandle
+	{CCECDHKeyGen, 1},     // 0x163
+	{CCEncryptDecrypt, 1}, // 0x164 (keyHandle)
+	{CCFlushContext, 0},   // flushHandle is a parameter, not a command handle
+	{CCLoadExternal, 0},
+	{CCMakeCredential, 1}, // 0x168
+	{CCNVReadPublic, 1},
+	{CCPolicyAuthorize, 1}, // 0x16A
+	{CCPolicyAuthValue, 1},
+	{CCPolicyCommandCode, 1},
+	{CCPolicyCounterTimer, 1}, // 0x16D
+	{CCPolicyCpHash, 1},       // 0x16E
+	{CCPolicyLocality, 1},     // 0x16F
+	{CCPolicyNameHash, 1},     // 0x170
+	{CCPolicyOR, 1},
+	{CCPolicyTicket, 1}, // 0x172
+	{CCReadPublic, 1},
+	{CCRSAEncrypt, 1},       // 0x174
+	{CCStartAuthSession, 2}, // tpmKey, bind
+	{CCVerifySignature, 1},
+	{CCECCParameters, 0}, // 0x178 (no handle)
+	{CCGetCapability, 0},
+	{CCGetRandom, 0},
+	{CCGetTestResult, 0},
+	{CCHash, 0},
+	{CCPCRRead, 0},
+	{CCPolicyPCR, 1},
+	{CCPolicyRestart, 1},
+	{CCReadClock, 0},
+	{CCPCRExtend, 1},
+	{CCPCRSetAuthValue, 1},         // 0x183
+	{CCNVCertify, 3},               // 0x184 (signHandle, authHandle, nvIndex)
+	{CCEventSequenceComplete, 2},   // 0x185 (pcrHandle, sequenceHandle)
+	{CCHashSequenceStart, 0},       // 0x186 (no handle)
+	{CCPolicyPhysicalPresence, 1},  // 0x187
+	{CCPolicyDuplicationSelect, 1}, // 0x188
+	{CCPolicyGetDigest, 1},
+	{CCTestParms, 0},              // 0x18A
+	{CCCommit, 1},                 // 0x18B (signHandle)
+	{CCPolicyPassword, 1},         // 0x18C
+	{CCZGen2Phase, 1},             // 0x18D (keyA)
+	{CCECEphemeral, 0},            // 0x18E (no handle)
+	{CCPolicyNvWritten, 1},        // 0x18F
+	{CCPolicyTemplate, 1},         // 0x190
+	{CCCreateLoaded, 1},           // 0x191 (parentHandle)
+	{CCPolicyAuthorizeNV, 3},      // 0x192 (authHandle, nvIndex, policySession)
+	{CCEncryptDecrypt2, 1},        // 0x193 (keyHandle)
+	{CCCertifyX509, 2},            // 0x197 (objectHandle, signHandle)
+	{CCACTSetTimeout, 1},          // 0x198 (actHandle)
+	{CCECCEncrypt, 1},             // 0x199 (keyHandle)
+	{CCECCDecrypt, 1},             // 0x19A (keyHandle)
+	{CCPolicyCapability, 1},       // 0x19B
+	{CCPolicyParameters, 1},       // 0x19C
+	{CCReadOnlyControl, 1},        // 0x1A0 (platform)
+	{CCPolicyTransportSPDM, 1},    // 0x1A1 (policySession)
+	{CCVerifySequenceComplete, 2}, // 0x1A3 (sequenceHandle, keyHandle)
+	{CCSignSequenceComplete, 2},   // 0x1A4 (sequenceHandle, keyHandle)
+	{CCVerifyDigestSignature, 1},  // 0x1A5 (keyHandle)
+	{CCSignDigest, 1},             // 0x1A6 (keyHandle)
+	{CCEncapsulate, 1},            // 0x1A7 (keyHandle)
+	{CCDecapsulate, 1},            // 0x1A8 (keyHandle)
+	{CCVerifySequenceStart, 1},    // 0x1A9 (keyHandle)
+	{CCSignSequenceStart, 1},      // 0x1AA (keyHandle)
+}
+
+// cmdGetCapability implements TPM2_GetCapability for the capabilities the
+// emulator advertises. Unsupported capabilities return an empty (count 0) list
+// of the requested type, which is structurally valid since every relevant
+// capability union member is a TPML_* beginning with a UINT32 count.
+func (t *TPM) cmdGetCapability(r *reader) []byte {
+	cap := r.u32()
+	property := r.u32()
+	count := r.u32()
+	if r.err != nil {
+		return errorResponse(RCInsufficient)
+	}
+
+	// An out-of-range capability selector is a TPM_RC_VALUE error, not a silent
+	// empty result (TPM 2.0 Part 3, TPM2_GetCapability). Defined selectors are
+	// the contiguous TPM_CAP block plus the vendor selector.
+	if cap > capLast && cap != CapVendorProperty {
+		return errorResponse(withParam(RCValue, 1)) // capability is parameter 1
+	}
+
+	var w writer
+	switch cap {
+	case CapTPMProperties:
+		more := t.writeProperties(&w, property, count)
+		return capabilityResponse(more, cap, w.bytes())
+	case CapAlgs:
+		more := writeAlgs(&w, property, count)
+		return capabilityResponse(more, cap, w.bytes())
+	case CapCommands:
+		more := writeCommands(&w, property, count)
+		return capabilityResponse(more, cap, w.bytes())
+	case CapHandles:
+		more := t.writeHandles(&w, property, count)
+		return capabilityResponse(more, cap, w.bytes())
+	case CapPCRs:
+		writePCRBanks(&w)
+		return capabilityResponse(no, cap, w.bytes())
+	default:
+		// Defined capability the emulator does not yet enumerate (e.g.
+		// TPM_CAP_ALGS, TPM_CAP_COMMANDS): a correctly-typed empty TPML_*. Every
+		// capability union member begins with a UINT32 count, so count 0 is a
+		// valid empty list of the requested type.
+		w.u32(0)
+		return capabilityResponse(no, cap, w.bytes())
+	}
+}
+
+// writeProperties emits the TPML_TAGGED_TPM_PROPERTY for properties with tag >=
+// property, capped at count, and reports whether more remain (moreData).
+func (t *TPM) writeProperties(w *writer, property, count uint32) byte {
+	// The fixed identity/capacity properties precede the run-time PT_VAR group;
+	// both are ascending, so the concatenation stays ascending.
+	all := append(append([]taggedProperty(nil), fixedProperties...), t.varProperties()...)
+	// TPM_PT values are organised in groups of ptGroup (PT_FIXED = 0x100,
+	// PT_VAR = 0x200) and a query returns properties from the group of the requested
+	// tag only — it must not run past the group boundary. Concatenating both groups
+	// and filtering solely on ">= property" leaked PT_VAR values (0x20E..0x211) into a
+	// PT_FIXED reply, and then reported moreData=NO, so a caller reading the fixed
+	// group saw run-time properties spliced onto the end and no indication anything
+	// was wrong. A tag below the first group is treated as starting at PT_FIXED.
+	group := property / ptGroup
+	if group == 0 {
+		group = ptFixed / ptGroup
+	}
+	var selected []taggedProperty
+	for _, p := range all {
+		if p.property >= property && p.property/ptGroup == group {
+			selected = append(selected, p)
+		}
+	}
+	// propertyCount bounds the number returned; count 0 yields an empty list with
+	// moreData=YES when properties exist (TPM 2.0 Part 3, TPM2_GetCapability).
+	more := no
+	if uint32(len(selected)) > count {
+		selected = selected[:count]
+		more = yes
+	}
+	w.u32(uint32(len(selected)))
+	for _, p := range selected {
+		w.u32(p.property)
+		w.u32(p.value)
+	}
+	return more
+}
+
+// writeAlgs emits the TPML_ALG_PROPERTY for algorithms with id >= property,
+// capped at count, reporting moreData. Each entry is a TPMS_ALG_PROPERTY: the
+// TPM_ALG_ID (UINT16) followed by its TPMA_ALGORITHM attributes (UINT32).
+func writeAlgs(w *writer, property, count uint32) byte {
+	var sel []taggedProperty
+	for _, a := range advertisedAlgs {
+		if a.property >= property {
+			sel = append(sel, a)
+		}
+	}
+	more := no
+	if uint32(len(sel)) > count {
+		sel = sel[:count]
+		more = yes
+	}
+	w.u32(uint32(len(sel)))
+	for _, a := range sel {
+		w.u16(uint16(a.property)) // TPM_ALG_ID
+		w.u32(a.value)            // TPMA_ALGORITHM
+	}
+	return more
+}
+
+// writeCommands emits the TPML_CCA for commands with code >= property, capped at
+// count, reporting moreData. Each entry is a TPMA_CC: the command index in the
+// low 16 bits plus the command-handle count in bits [27:25].
+func writeCommands(w *writer, property, count uint32) byte {
+	var sel []uint32
+	for _, c := range commandTable {
+		if c.cc >= property {
+			sel = append(sel, c.cc&ccAttrIndexMask|c.cHandles<<ccAttrCHandleSh)
+		}
+	}
+	more := no
+	if uint32(len(sel)) > count {
+		sel = sel[:count]
+		more = yes
+	}
+	w.u32(uint32(len(sel)))
+	for _, v := range sel {
+		w.u32(v)
+	}
+	return more
+}
+
+// permanentHandles is the ascending list of permanent handles the TPM exposes,
+// reported under TPM_CAP_HANDLES for the permanent range.
+var permanentHandles = []uint32{
+	RHOwner, RHNull, RHPW, RHLockout, RHEndorsement, RHPlatform, RHPlatformNV,
+}
+
+// writeHandles emits the TPML_HANDLE of in-use handles at or above property,
+// within property's handle range: permanent handles, loaded sessions, and
+// transient/persistent objects. NV index handles arrive with that subsystem.
+func (t *TPM) writeHandles(w *writer, property, count uint32) byte {
+	var pool []uint32
+	switch classifyHandle(property) {
+	case htPermanent:
+		pool = permanentHandles
+	case htHMACSession, htPolicySession:
+		pool = t.sessions.handles()
+	case htTransient:
+		for h := range t.objects.transient {
+			pool = append(pool, h)
+		}
+	case htPersistent:
+		pool = t.objects.persistentHandles()
+	case htNVIndex:
+		pool = t.nv.handles()
+	}
+	sort.Slice(pool, func(i, j int) bool { return pool[i] < pool[j] })
+
+	var sel []uint32
+	for _, h := range pool {
+		if h >= property {
+			sel = append(sel, h)
+		}
+	}
+	more := no
+	if uint32(len(sel)) > count {
+		sel = sel[:count]
+		more = yes
+	}
+	w.u32(uint32(len(sel)))
+	for _, h := range sel {
+		w.u32(h)
+	}
+	return more
+}
+
+// writePCRBanks emits a TPML_PCR_SELECTION advertising every supported bank with
+// all numPCR PCRs present.
+func writePCRBanks(w *writer) {
+	sels := make([]pcrSelection, 0, len(supportedPCRBanks))
+	for _, alg := range supportedPCRBanks {
+		sels = append(sels, pcrSelection{hash: alg, selectMap: fullPCRBitmap()})
+	}
+	writePCRSelectionList(w, sels)
+}
+
+// fullPCRBitmap returns a select bitmap with PCRs 0..numPCR-1 set.
+func fullPCRBitmap() []byte {
+	b := make([]byte, (numPCR+7)/8)
+	for i := 0; i < numPCR; i++ {
+		b[i/8] |= 1 << (uint(i) % 8)
+	}
+	return b
+}
+
+// capabilityResponse frames the TPM2_GetCapability response: moreData followed
+// by the capability tag and the capability-specific list already in data.
+func capabilityResponse(more byte, cap uint32, data []byte) []byte {
+	var w writer
+	w.u8(more)
+	w.u32(cap)
+	w.raw(data)
+	return successResponse(w.bytes(), 0)
+}
